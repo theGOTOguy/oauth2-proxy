@@ -4,8 +4,11 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"regexp"
+	"strings"
 
 	"github.com/gorilla/mux"
+	"github.com/justinas/alice"
 	"github.com/oauth2-proxy/oauth2-proxy/v7/pkg/apis/options"
 	"github.com/oauth2-proxy/oauth2-proxy/v7/pkg/logger"
 )
@@ -23,7 +26,9 @@ func NewProxy(upstreams options.Upstreams, sigData *options.SignatureData, error
 
 	for _, upstream := range upstreams {
 		if upstream.Static {
-			m.registerStaticResponseHandler(upstream)
+			if err := m.registerStaticResponseHandler(upstream); err != nil {
+				return nil, fmt.Errorf("could not register static upstream %q: %v", upstream.ID, err)
+			}
 			continue
 		}
 
@@ -33,9 +38,13 @@ func NewProxy(upstreams options.Upstreams, sigData *options.SignatureData, error
 		}
 		switch u.Scheme {
 		case fileScheme:
-			m.registerFileServer(upstream, u)
+			if err := m.registerFileServer(upstream, u); err != nil {
+				return nil, fmt.Errorf("could not register file upstream %q: %v", upstream.ID, err)
+			}
 		case httpScheme, httpsScheme:
-			m.registerHTTPUpstreamProxy(upstream, u, sigData, errorHandler)
+			if err := m.registerHTTPUpstreamProxy(upstream, u, sigData, errorHandler); err != nil {
+				return nil, fmt.Errorf("could not register HTTP upstream %q: %v", upstream.ID, err)
+			}
 		default:
 			return nil, fmt.Errorf("unknown scheme for upstream %q: %q", upstream.ID, u.Scheme)
 		}
@@ -55,21 +64,31 @@ func (m *multiUpstreamProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request
 }
 
 // registerStaticResponseHandler registers a static response handler with at the given path.
-func (m *multiUpstreamProxy) registerStaticResponseHandler(upstream options.Upstream) {
+func (m *multiUpstreamProxy) registerStaticResponseHandler(upstream options.Upstream) error {
 	logger.Printf("mapping path %q => static response %d", upstream.Path, derefStaticCode(upstream.StaticCode))
-	m.registerSimpleHandler(upstream.Path, newStaticResponseHandler(upstream.ID, upstream.StaticCode))
+	return m.registerHandler(upstream, newStaticResponseHandler(upstream.ID, upstream.StaticCode))
 }
 
 // registerFileServer registers a new fileServer based on the configuration given.
-func (m *multiUpstreamProxy) registerFileServer(upstream options.Upstream, u *url.URL) {
+func (m *multiUpstreamProxy) registerFileServer(upstream options.Upstream, u *url.URL) error {
 	logger.Printf("mapping path %q => file system %q", upstream.Path, u.Path)
-	m.registerSimpleHandler(upstream.Path, newFileServer(upstream.ID, upstream.Path, u.Path))
+	return m.registerHandler(upstream, newFileServer(upstream.ID, upstream.Path, u.Path))
 }
 
 // registerHTTPUpstreamProxy registers a new httpUpstreamProxy based on the configuration given.
-func (m *multiUpstreamProxy) registerHTTPUpstreamProxy(upstream options.Upstream, u *url.URL, sigData *options.SignatureData, errorHandler ProxyErrorHandler) {
+func (m *multiUpstreamProxy) registerHTTPUpstreamProxy(upstream options.Upstream, u *url.URL, sigData *options.SignatureData, errorHandler ProxyErrorHandler) error {
 	logger.Printf("mapping path %q => upstream %q", upstream.Path, upstream.URI)
-	m.registerSimpleHandler(upstream.Path, newHTTPUpstreamProxy(upstream, u, sigData, errorHandler))
+	return m.registerHandler(upstream, newHTTPUpstreamProxy(upstream, u, sigData, errorHandler))
+}
+
+// registerHandler ensures the given handler is regiestered with the serveMux.
+func (m *multiUpstreamProxy) registerHandler(upstream options.Upstream, handler http.Handler) error {
+	if upstream.RewriteTarget == "" {
+		m.registerSimpleHandler(upstream.Path, handler)
+		return nil
+	}
+
+	return m.registerRewriteHandler(upstream, handler)
 }
 
 // registerSimpleHandler maintains the behaviour of the go standard serveMux
@@ -80,4 +99,23 @@ func (m *multiUpstreamProxy) registerSimpleHandler(path string, handler http.Han
 	} else {
 		m.serveMux.Path(path).Handler(handler)
 	}
+}
+
+// registerRewriteHandler ensures the handler is registered for all paths
+// which match the regex defined in the Path.
+// Requests to the handler will have the request path rewritten before the
+// request is made to the next handler.
+func (m *multiUpstreamProxy) registerRewriteHandler(upstream options.Upstream, handler http.Handler) error {
+	rewriteRegExp, err := regexp.Compile(upstream.Path)
+	if err != nil {
+		return fmt.Errorf("invalid path %q for upstream: %v", upstream.Path, err)
+	}
+
+	rewrite := newRewritePath(rewriteRegExp, upstream.RewriteTarget)
+	h := alice.New(rewrite).Then(handler)
+	m.serveMux.MatcherFunc(func(req *http.Request, match *mux.RouteMatch) bool {
+		return rewriteRegExp.MatchString(req.URL.Path)
+	}).Handler(h)
+
+	return nil
 }
