@@ -52,6 +52,12 @@ var _ = Describe("Proxy Suite", func() {
 				StaticCode: &accepted,
 			},
 			{
+				ID:         "static-backend-long",
+				Path:       "/static/long",
+				Static:     true,
+				StaticCode: &accepted,
+			},
+			{
 				ID:   "bad-http-backend",
 				Path: "/bad-http/",
 				URI:  "http://::1",
@@ -66,6 +72,17 @@ var _ = Describe("Proxy Suite", func() {
 				ID:            "backend-with-rewrite-prefix",
 				Path:          "^/rewrite-prefix/(.*)",
 				RewriteTarget: "/different/backend/path/$1",
+				URI:           serverAddr,
+			},
+			{
+				ID:   "double-match-plain",
+				Path: "/double-match/",
+				URI:  serverAddr,
+			},
+			{
+				ID:            "double-match-rewrite",
+				Path:          "^/double-match/(.*)",
+				RewriteTarget: "/double-match/rewrite/$1",
 				URI:           serverAddr,
 			},
 		}
@@ -258,6 +275,36 @@ var _ = Describe("Proxy Suite", func() {
 				raw:    "Authenticated",
 			},
 			upstream: "static-backend-no-trailing-slash",
+		}),
+		Entry("should match longest path first", &proxyTableInput{
+			target: "http://example.localhost/static/long",
+			response: testHTTPResponse{
+				code:   202,
+				header: map[string][]string{},
+				raw:    "Authenticated",
+			},
+			upstream: "static-backend-long",
+		}),
+		Entry("should match rewrite path first", &proxyTableInput{
+			target: "http://example.localhost/double-match/foo",
+			response: testHTTPResponse{
+				code: 200,
+				header: map[string][]string{
+					contentType: {applicationJSON},
+				},
+				request: testHTTPRequest{
+					Method: "GET",
+					URL:    "http://example.localhost/double-match/rewrite/foo",
+					Header: map[string][]string{
+						"Gap-Auth":      {""},
+						"Gap-Signature": {"sha256 eYyUNdsrTmnvFpavpP8AdHGUGzqJ39QEjqn0/3fQPHA="},
+					},
+					Body:       []byte{},
+					Host:       "example.localhost",
+					RequestURI: "http://example.localhost/double-match/rewrite/foo",
+				},
+			},
+			upstream: "double-match-rewrite",
 		}),
 	)
 })
